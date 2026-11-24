@@ -162,7 +162,7 @@ export class ExtensionState extends Disposable {
 
 		let reviews = this.getCodeReviews();
 		if (typeof reviews[oldRepo] !== 'undefined') {
-			reviews[newRepo] = reviews[oldRepo];
+			reviews[newRepo] = { ...reviews[oldRepo], ...reviews[newRepo] };
 			delete reviews[oldRepo];
 			this.setCodeReviews(reviews);
 		}

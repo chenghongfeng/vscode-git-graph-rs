@@ -70,6 +70,17 @@ Beyond the Rust engine, these are new relative to the original
   operations report that they need Git. Conversely, on a platform with no prebuilt engine binary
   the extension runs entirely over the `git` CLI.
 
+## Working with multiple repositories
+
+Git Graph scans every workspace folder and up to three levels of subfolders by default, including
+inside an existing repository. Working trees registered with `git worktree` are discovered as well,
+even under a hidden directory such as `.worktrees/`. When multiple repositories are available, use
+the **Repos** dropdown in the toolbar to choose the repository whose history and Git actions you
+want to use. The workspace remembers the last selected repository.
+
+Change `git-graph-rs.maxDepthOfRepoSearch` to scan deeper, or use **Git Graph: Add Git Repository**
+from the Command Palette to add a particular repository manually.
+
 ## Performance
 
 The numbers below compare **the backend the extension actually ships** with **what the original

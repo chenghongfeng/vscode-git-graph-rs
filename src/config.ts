@@ -381,7 +381,7 @@ class Config {
 	 * Get the value of the `git-graph-rs.maxDepthOfRepoSearch` Extension Setting.
 	 */
 	get maxDepthOfRepoSearch() {
-		return this.config.get('maxDepthOfRepoSearch', 0);
+		return this.config.get('maxDepthOfRepoSearch', 3);
 	}
 
 	/**

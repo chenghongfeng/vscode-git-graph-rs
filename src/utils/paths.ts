@@ -12,7 +12,7 @@ const FS_REGEX = /\\/g;
  * @returns The normalised path.
  */
 export function getPathFromUri(uri: vscode.Uri) {
-	return uri.fsPath.replace(FS_REGEX, '/');
+	return getPathFromStr(uri.fsPath);
 }
 
 /**
@@ -21,7 +21,10 @@ export function getPathFromUri(uri: vscode.Uri) {
  * @returns The normalised path.
  */
 export function getPathFromStr(str: string) {
-	return str.replace(FS_REGEX, '/');
+	const normalized = str.replace(FS_REGEX, '/');
+	return process.platform === 'win32' && /^[a-z]:\//.test(normalized)
+		? normalized[0].toUpperCase() + normalized.slice(1)
+		: normalized;
 }
 
 /**

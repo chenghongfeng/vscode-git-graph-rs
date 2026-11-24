@@ -198,6 +198,7 @@ class GitGraphView {
 		this.graph = new Graph('commitGraph', viewElem, this.config.graph, this.config.mute);
 
 		this.repoDropdown = new Dropdown('repoDropdown', true, false, strings.dropdownRepos, (values) => {
+			this.loadViewTo = null;
 			this.loadRepo(values[0]);
 		}, (option) => {
 			dialog.showMessage('<strong>' + escapeHtml(strings.repoInfoTitle) + '</strong><br>' + escapeHtml(formatStr(strings.repoInfoPath, option.value)));
@@ -457,7 +458,11 @@ class GitGraphView {
 		this.renderFetchButton();
 		this.renderFilterButton();
 		closeCommitDetails(this, false);
-		if (switchingRepo) this.settingsWidget.close();
+		if (switchingRepo) {
+			if (dialog.isOpen()) dialog.close();
+			if (contextMenu.isOpen()) contextMenu.close();
+			this.settingsWidget.close();
+		}
 		this.reflogView.close();
 		this.worktreeDialog.close();
 		this.statisticsView.close();

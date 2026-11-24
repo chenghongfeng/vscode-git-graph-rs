@@ -22,7 +22,7 @@ import {
 	isSafeStashSelector,
 	isValidCommitHash,
 } from './utils/git';
-import { getPathFromUri, pathWithTrailingSlash, realpath } from './utils/paths';
+import { getPathFromStr, getPathFromUri, pathWithTrailingSlash, realpath } from './utils/paths';
 import { AbortLike, detectTerminalShellKind, openGitTerminal, quoteForShell, resolveSpawnOutput } from './utils/childProcess';
 import { showErrorMessage } from './utils/actions';
 import { Disposable } from './utils/disposable';
@@ -1039,6 +1039,7 @@ export class DataSource extends Disposable {
 	 * @returns STRING => The root of the repository, NULL => `pathOfPotentialRepo` is not in a repository.
 	 */
 	public repoRoot(pathOfPotentialRepo: string) {
+		pathOfPotentialRepo = getPathFromStr(pathOfPotentialRepo);
 		return this.backend.repoRoot(pathOfPotentialRepo).then((root) => getPathFromUri(vscode.Uri.file(path.normalize(root)))).then(async (pathReturnedByGit) => {
 			if (process.platform === 'win32') {
 				// On Windows Mapped Network Drives with Git >= 2.25.0, `git rev-parse --show-toplevel` returns the UNC Path for the Mapped Network Drive, instead of the Drive Letter.
@@ -1977,7 +1978,7 @@ export class DataSource extends Disposable {
 				// already written behind in the temp directory.
 				fs.writeFileSync(seqEditorFile, author === null
 					? 'const fs=require("fs");const hash=process.argv[2];const todo=process.argv[process.argv.length-1];const text=fs.readFileSync(todo,"utf8").replace(/^pick ([0-9a-f]+)/gm,(line,abbrev)=>hash.startsWith(abbrev)?line.replace(/^pick/,"reword"):line);fs.writeFileSync(todo,text);'
-					: 'const fs=require("fs");const hash=process.argv[2];const todo=process.argv[process.argv.length-1];const amend="exec git commit --amend --no-edit --author=\\"$(cat \\"$GG_AMEND_AUTHOR_FILE\\")\\" -F \\"$GG_AMEND_MESSAGE\\"";const text=fs.readFileSync(todo,"utf8").replace(/^pick ([0-9a-f]+)/gm,(line,abbrev)=>hash.startsWith(abbrev)?line+"\\n"+amend:line);fs.writeFileSync(todo,text);');
+					: 'const fs=require("fs");const hash=process.argv[2];const todo=process.argv[process.argv.length-1];const amend="exec git commit --amend --no-edit --author=\\"$(cat \\"$GG_AMEND_AUTHOR_FILE\\")\\" -F \\"$GG_AMEND_MESSAGE\\"";const text=fs.readFileSync(todo,"utf8").replace(/^pick ([0-9a-f]+).*$/gm,(line,abbrev)=>hash.startsWith(abbrev)?line+"\\n"+amend:line);fs.writeFileSync(todo,text);');
 				fs.writeFileSync(msgEditorFile, 'const fs=require("fs");fs.writeFileSync(process.argv[process.argv.length-1],fs.readFileSync(process.argv[2],"utf8"));');
 				fs.writeFileSync(messageFile, message);
 				if (author !== null) fs.writeFileSync(authorFile, author);

@@ -1116,7 +1116,8 @@
 				},
 				"git-graph-rs.maxDepthOfRepoSearch": {
 					"type": "number",
-					"default": 0,
+					"minimum": 0,
+					"default": 3,
 					"description": "%config.git-graph-rs.maxDepthOfRepoSearch.description%"
 				},
 				"git-graph-rs.mobileAdaptation": {
