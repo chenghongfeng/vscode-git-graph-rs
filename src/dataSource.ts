@@ -22,7 +22,7 @@ import {
 	isSafeStashSelector,
 	isValidCommitHash,
 } from './utils/git';
-import { getPathFromUri, pathWithTrailingSlash, realpath } from './utils/paths';
+import { getPathFromStr, getPathFromUri, pathWithTrailingSlash, realpath } from './utils/paths';
 import { AbortLike, detectTerminalShellKind, openGitTerminal, quoteForShell, resolveSpawnOutput } from './utils/childProcess';
 import { showErrorMessage } from './utils/actions';
 import { Disposable } from './utils/disposable';
@@ -1069,6 +1069,7 @@ export class DataSource extends Disposable {
 	 * @returns STRING => The root of the repository, NULL => `pathOfPotentialRepo` is not in a repository.
 	 */
 	public repoRoot(pathOfPotentialRepo: string) {
+		pathOfPotentialRepo = getPathFromStr(pathOfPotentialRepo);
 		return this.backend.repoRoot(pathOfPotentialRepo).then((root) => getPathFromUri(vscode.Uri.file(path.normalize(root)))).then(async (pathReturnedByGit) => {
 			if (process.platform === 'win32') {
 				// On Windows Mapped Network Drives with Git >= 2.25.0, `git rev-parse --show-toplevel` returns the UNC Path for the Mapped Network Drive, instead of the Drive Letter.

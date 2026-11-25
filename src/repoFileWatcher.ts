@@ -92,6 +92,7 @@ export class RepoFileWatcher {
 	 * Stop watching the repository for file events.
 	 */
 	public stop() {
+		this.repo = null;
 		if (this.fsWatcher !== null) {
 			// If there is an existing File System Watcher, stop it
 			this.fsWatcher.dispose();

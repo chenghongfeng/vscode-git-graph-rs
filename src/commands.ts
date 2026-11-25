@@ -458,9 +458,8 @@ export class CommandManager extends Disposable {
 			}, (progress) => modules.runAutomationSuite({
 				logger: this.logger,
 				onProgress: (p) => progress.report({ message: p.phase + ' ' + p.index + '/' + p.total + ' — ' + p.actionId }),
-				// The fixture's submodule becomes a known repository the moment it is seeded: a
-				// repository materialised mid-session is never discovered on its own (both the
-				// workspace scan and the submodule scan skip paths inside a known repository).
+				// The suite needs the fixture's submodule immediately, before the buffered
+				// workspace watcher or a later scan could discover it.
 				registerRepo: async (repo) => {
 					if (!this.repoManager.isKnownRepo(repo)) await this.repoManager.registerRepo(repo, false);
 				}

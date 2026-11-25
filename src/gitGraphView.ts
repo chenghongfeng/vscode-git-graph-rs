@@ -63,6 +63,7 @@ import {
 import { encodeJsonForInlineScript, getNonce } from './utils/format';
 import { unableToFindGitMsg } from './utils/findGit';
 import { Disposable, toDisposable } from './utils/disposable';
+import { getPathFromStr } from './utils/paths';
 
 /**
  * Whether the complete (remote-refs-included) response of `sendRemoteRefsFollowUp` differs from
@@ -1238,6 +1239,7 @@ export class GitGraphView extends Disposable {
 				});
 				break;
 			case 'loadCommits': {
+				if (getPathFromStr(msg.repo) !== this.currentRepo) break;
 				this.loadCommitsRefreshId = msg.refreshId;
 				const startTime = Date.now();
 				// Remote-tracking refs dominate the ref scan on repositories with many of them (a
@@ -1252,6 +1254,7 @@ export class GitGraphView extends Disposable {
 				if (!msg.gerritFetchRefs) {
 					// Gerrit integration disabled for this repository: load the commits without any Gerrit data
 					const commitData = await this.getCommitsCached(msg, null, true, msg.hard, deferRemoteRefs);
+					if (!this.isCurrentCommitLoad(msg)) break;
 					this.sendMessage({
 						command: 'loadCommits',
 						refreshId: msg.refreshId,
@@ -1269,6 +1272,7 @@ export class GitGraphView extends Disposable {
 					// The Gerrit data is already cached (under the requested fetch limit): serve it instantly from the cache
 					const page = await this.loadGerritPage(msg, this.gerritCache.get(msg.repo)!, null, null, deferRemoteRefs);
 					const commitData = page.commitData;
+					if (!this.isCurrentCommitLoad(msg)) break;
 					this.sendMessage({
 						command: 'loadCommits',
 						refreshId: msg.refreshId,
@@ -1298,6 +1302,7 @@ export class GitGraphView extends Disposable {
 					const staleRefs = stalePage !== null ? stalePage.refs : null;
 					const staleStates = stalePage !== null ? stalePage.states : null;
 					const commitData = stalePage !== null ? stalePage.commitData : await this.getCommitsCached(msg, null, true, msg.hard, deferRemoteRefs);
+					if (!this.isCurrentCommitLoad(msg)) break;
 					this.sendMessage({
 						command: 'loadCommits',
 						refreshId: msg.refreshId,
@@ -1369,6 +1374,13 @@ export class GitGraphView extends Disposable {
 				break;
 			case 'loadRepoInfo': {
 				this.loadRepoInfoRefreshId = msg.refreshId;
+				// Select the repository in request order. A slow read for the previous selection
+				// must not change which repository is watched or restored on reopening the view.
+				// Requests normally carry the known, normalised path; a caller passing a native
+				// path (the automation API) is mapped onto it.
+				const selectedRepo = await this.repoManager.getKnownRepo(getPathFromStr(msg.repo));
+				if (this.isDisposed()) break;
+				if (selectedRepo !== null) this.setCurrentRepo(selectedRepo);
 				const startTime = Date.now();
 				// The remote-tracking refs are NOT scanned for this response while the view is
 				// EMPTY (see `viewHasCommits`): the branch dropdown starts local-only, and the
@@ -1385,9 +1397,11 @@ export class GitGraphView extends Disposable {
 				let isRepo = true;
 				if (repoInfo.error) {
 					// If an error occurred, check to make sure the repo still exists
-					isRepo = (await this.dataSource.repoRoot(msg.repo)) !== null;
-					if (!isRepo) repoInfo.error = null; // If the error is caused by the repo no longer existing, clear the error message
+					const root = await this.dataSource.repoRoot(msg.repo);
+					isRepo = root !== null && path.relative(root, getPathFromStr(msg.repo)) === '';
 				}
+				if (this.isDisposed() || this.loadRepoInfoRefreshId !== msg.refreshId) break;
+				if (!isRepo) repoInfo.error = null; // Let the webview refresh its repository list
 				this.sendMessage({
 					command: 'loadRepoInfo',
 					refreshId: msg.refreshId,
@@ -1397,18 +1411,6 @@ export class GitGraphView extends Disposable {
 					operationState: operationState
 				});
 				this.logger.log('Loaded repository info in ' + (Date.now() - startTime) + ' ms (' + repoInfo.branches.length + ' branches)');
-				if (msg.repo !== this.currentRepo) {
-					this.currentRepo = msg.repo;
-					this.extensionState.setLastActiveRepo(msg.repo);
-					this.repoFileWatcher.start(msg.repo);
-					// The signature of the previous repository says nothing about this one
-					this.lastRepoSignature = null;
-					// The uncommitted count of the previous repository says nothing about this one
-					this.uncommittedStabiliser.reset();
-					// The view switches to an empty repository: the remote-refs deferral applies
-					// again until its first page of commits is rendered (see `viewHasCommits`)
-					this.viewHasCommits = false;
-				}
 				break;
 			}
 			case 'loadRepos':
@@ -1706,6 +1708,25 @@ export class GitGraphView extends Disposable {
 		}
 	}
 
+	private setCurrentRepo(repo: string | null) {
+		if (repo === this.currentRepo) return;
+		this.currentRepo = repo;
+		this.loadCommitsRefreshId++;
+		if (repo === null) {
+			this.repoFileWatcher.stop();
+		} else {
+			this.extensionState.setLastActiveRepo(repo);
+			this.repoFileWatcher.start(repo);
+		}
+		this.lastRepoSignature = null;
+		this.uncommittedStabiliser.reset();
+		this.viewHasCommits = false;
+	}
+
+	private isCurrentCommitLoad(msg: RequestLoadCommits) {
+		return !this.isDisposed() && getPathFromStr(msg.repo) === this.currentRepo && msg.refreshId === this.loadCommitsRefreshId;
+	}
+
 	private update() {
 		this.panel.webview.html = this.getHtmlForWebview();
 	}
@@ -1845,7 +1866,7 @@ export class GitGraphView extends Disposable {
 			body = `<body class="unableToLoad">
 			<h2>${t('unableToLoadGitGraph')}</h2>
 			<p class="unableToLoadMessage">${t('noReposWhenLastScanned')}</p>
-			<p>${t('noReposHint', 'https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings#max-depth-of-repo-search')}</p>
+			<p>${t('noReposHint', 'https://github.com/neophack/vscode-git-graph-rs#working-with-multiple-repositories')}</p>
 			<p><div id="rescanForReposBtn" class="roundedBtn" role="button" tabindex="0">${t('rescanForReposButton')}</div></p>
 			<script nonce="${nonce}">(function(){
 				var api = acquireVsCodeApi(), btn = document.getElementById('rescanForReposBtn');
@@ -2125,7 +2146,7 @@ export class GitGraphView extends Disposable {
 		// state for the next refresh to settle
 		let attemptsLeft = Math.ceil((2 * GitGraphView.UNCOMMITTED_ZERO_CONFIRM_MS) / GitGraphView.UNCOMMITTED_RECHECK_MS);
 		while (true) {
-			if (this.isDisposed() || this.loadCommitsRefreshId !== msg.refreshId) return; // superseded by a newer load request
+			if (!this.isCurrentCommitLoad(msg)) return; // superseded by a newer load request
 
 			if (msg.hard === true) {
 				// A hard refresh wiped the view (the row included) before this pipeline started, so
@@ -2519,7 +2540,7 @@ export class GitGraphView extends Disposable {
 	 */
 	private async loadCommitsGerritFollowUp(msg: RequestLoadCommits, previousRefs: string[] | null, pendingCommitData: GitCommitData): Promise<{ states: GerritChangeState[] | null, commitData: GitCommitData }> {
 		const cache = await this.loadGerritData(msg.repo, msg.gerritStatusFilter, this.gerritFetchLimitOf(msg), msg.hard === true);
-		if (this.loadCommitsRefreshId !== msg.refreshId) return { states: null, commitData: pendingCommitData }; // superseded by a newer load request
+		if (!this.isCurrentCommitLoad(msg)) return { states: null, commitData: pendingCommitData }; // superseded by a newer load request
 
 		if (cache === null) {
 			// The Gerrit pipeline failed: degrade to the plain view (as before)
@@ -2532,7 +2553,7 @@ export class GitGraphView extends Disposable {
 		// to the one already rendered keeps the current graph, skipping the getCommits round-trip
 		// (which dominates the load time on large repositories).
 		const page = await this.loadGerritPage(msg, cache, previousRefs, pendingCommitData, false);
-		if (this.loadCommitsRefreshId !== msg.refreshId) return { states: null, commitData: page.commitData }; // superseded by a newer load request
+		if (!this.isCurrentCommitLoad(msg)) return { states: null, commitData: page.commitData }; // superseded by a newer load request
 		await this.sendGerritLoadStage(msg, GitGraphView.lightGerritStates(page.states), page.commitData);
 
 		// Stage 2 (review information): the event timelines arrive last, on the unchanged graph
@@ -2589,7 +2610,7 @@ export class GitGraphView extends Disposable {
 	private async sendRemoteRefsFollowUp(msg: RequestLoadCommits, gerritRefs: ReadonlyArray<string> | null, commitData: GitCommitData, gerritStates: GerritChangeState[] | null, deferUncommittedChanges: boolean, forceFresh: boolean): Promise<GitCommitData> {
 		if (!msg.showRemoteBranches || commitData.error !== null) return commitData;
 		const complete = await this.getCommitsCached(msg, gerritRefs, deferUncommittedChanges, forceFresh, false);
-		if (this.loadCommitsRefreshId !== msg.refreshId) return complete; // superseded by a newer load request
+		if (!this.isCurrentCommitLoad(msg)) return complete; // superseded by a newer load request
 
 		if (remoteRefsFollowUpChanged(commitData, complete)) {
 			this.sendMessage({
@@ -2719,6 +2740,7 @@ export class GitGraphView extends Disposable {
 	 * @param event The repository-set change.
 	 */
 	private handleReposChange(event: RepoChangeEvent) {
+		if (this.currentRepo !== null && event.repos[this.currentRepo] === undefined) this.setCurrentRepo(null);
 		const loadViewTo = event.loadRepo !== null ? { repo: event.loadRepo } : null;
 		if ((event.numRepos === 0 && this.isGraphViewLoaded) || (event.numRepos > 0 && !this.isGraphViewLoaded)) {
 			this.loadViewTo = loadViewTo;

@@ -151,7 +151,7 @@ let vscodeStub = null;
  * tests); anything else resolves to undefined like the previous no-op stub. */
 let commandHandlers = {};
 
-export async function bootRealView(repo) {
+export async function bootRealView(repo, { workspaceFolders = [repo], workspaceState = {} } = {}) {
 	graphPanel = null; // one live graph view per process: a fresh boot takes over the routing
 	if (vscodeStub === null) vscodeStub = {
 		Uri: {
@@ -159,7 +159,7 @@ export async function bootRealView(repo) {
 			joinPath: (uri, ...segments) => vscodeStub.Uri.file(path.join(uri.fsPath, ...segments))
 		},
 		workspace: {
-			workspaceFolders: [{ uri: null, name: path.basename(repo), index: 0 }],
+			workspaceFolders: [],
 			getConfiguration: () => new FakeConfiguration(),
 			onDidChangeConfiguration: () => disposable(),
 			onDidChangeWorkspaceFolders: () => disposable(),
@@ -203,7 +203,7 @@ export async function bootRealView(repo) {
 		ViewColumn: { Active: -1, Beside: -2, One: 1 },
 		ConfigurationTarget: { Global: 1, Workspace: 2 }
 	};
-	vscodeStub.workspace.workspaceFolders[0] = { uri: vscodeStub.Uri.file(repo), name: path.basename(repo), index: 0 };
+	vscodeStub.workspace.workspaceFolders = workspaceFolders.map((folder, index) => ({ uri: vscodeStub.Uri.file(folder), name: path.basename(folder), index }));
 
 	const originalLoad = Module._load;
 	let vscodeStubActive = false;
@@ -242,8 +242,8 @@ export async function bootRealView(repo) {
 	// preferences, ...) through workspaceState, and stateless stubs made every read forget every
 	// write — an action that starts a code review and then updates it answered "not found" in the
 	// harness while working in the real editor. Reads see writes, like the editor's memento.
-	const makeMemento = () => {
-		const values = new Map();
+	const makeMemento = (initial = {}) => {
+		const values = new Map(Object.entries(initial));
 		return {
 			get: (key, fallback) => (values.has(key) ? values.get(key) : fallback),
 			set: async (key, value) => { values.set(key, value); },
@@ -255,7 +255,7 @@ export async function bootRealView(repo) {
 	const context = {
 		subscriptions: [], extensionPath: rootDir, extensionUri: vscodeStub.Uri.file(rootDir),
 		globalState: makeMemento(),
-		workspaceState: makeMemento(),
+		workspaceState: makeMemento(workspaceState),
 		globalStoragePath: path.join(rootDir, 'target', 'harness-global-storage'),
 		storagePath: path.join(rootDir, 'target', 'harness-storage'),
 		asAbsolutePath: (p) => path.join(rootDir, p)

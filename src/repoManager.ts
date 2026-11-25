@@ -20,6 +20,13 @@ import { BufferedQueue } from './utils/bufferedQueue';
 import { Disposable, toDisposable } from './utils/disposable';
 import { EventEmitter, GgEvent } from './utils/event';
 
+const REPO_SCAN_EXCLUDED_FOLDERS = new Set(['build', 'coverage', 'dist', 'node_modules', 'out', 'target', 'venv', '__pycache__']);
+
+/** Can the repository scan descend into this directory? */
+function isScannableFolder(entry: fs.Dirent) {
+	return entry.isDirectory() && !entry.name.startsWith('.') && !REPO_SCAN_EXCLUDED_FOLDERS.has(entry.name);
+}
+
 export interface RepoChangeEvent {
 	readonly repos: GitRepoSet;
 	readonly numRepos: number;
@@ -64,10 +71,20 @@ export class RepoManager extends Disposable {
 		// comparison; migrate them to the normalised form
 		this.repos = {};
 		const savedRepos = extensionState.getRepos();
+		const lastActiveRepo = extensionState.getLastActiveRepo();
+		let pathsChanged = false;
 		for (const repo of Object.keys(savedRepos)) {
 			const normalised = getPathFromStr(repo);
-			if (typeof this.repos[normalised] === 'undefined') this.repos[normalised] = savedRepos[repo];
+			if (typeof this.repos[normalised] === 'undefined' || repo === lastActiveRepo ||
+				(repo === normalised && getPathFromStr(lastActiveRepo ?? '') !== normalised)) {
+				this.repos[normalised] = savedRepos[repo];
+			}
+			if (repo !== normalised) {
+				extensionState.transferRepo(repo, normalised);
+				pathsChanged = true;
+			}
 		}
+		if (pathsChanged) extensionState.saveRepos(this.repos);
 		this.ignoredRepos = extensionState.getIgnoredRepos().map((repo) => getPathFromStr(repo)).filter((repo, i, repos) => repos.indexOf(repo) === i);
 		this.maxDepthOfRepoSearch = getConfig().maxDepthOfRepoSearch;
 
@@ -81,7 +98,8 @@ export class RepoManager extends Disposable {
 		this.onWatcherChangeQueue = new BufferedQueue<string>(this.processOnWatcherChangeEvent.bind(this), this.sendRepos.bind(this));
 		this.checkRepoConfigQueue = new BufferedQueue<string>(this.checkRepoForNewConfig.bind(this), this.sendRepos.bind(this));
 
-		this.startupTasks();
+		this.startWatchingFolders();
+		void this.startupTasks().catch((error) => this.logger.logError('Repository startup tasks failed: ' + error));
 
 		this.registerDisposables(
 			// Monitor changes to the workspace folders to:
@@ -89,29 +107,19 @@ export class RepoManager extends Disposable {
 			// - remove repositories within deleted folders
 			// - apply changes to the order of workspace folders
 			vscode.workspace.onDidChangeWorkspaceFolders(async (e) => {
-				let changes = false, path;
-				if (e.added.length > 0) {
-					for (let i = 0; i < e.added.length; i++) {
-						path = getPathFromUri(e.added[i].uri);
-						if (await this.searchDirectoryForRepos(path, this.maxDepthOfRepoSearch)) changes = true;
-						this.startWatchingFolder(path);
-					}
-				}
-				if (e.removed.length > 0) {
-					for (let i = 0; i < e.removed.length; i++) {
-						path = getPathFromUri(e.removed[i].uri);
-						if (this.removeReposWithinFolder(path)) changes = true;
-						this.stopWatchingFolder(path);
-					}
+				const removed = e.removed.map((folder) => getPathFromUri(folder.uri));
+				for (const folder of removed) this.stopWatchingFolder(folder);
+				let changes = removed.length > 0 && this.removeReposNotInWorkspace(removed);
+				for (const folder of e.added) {
+					const directory = getPathFromUri(folder.uri);
+					this.startWatchingFolder(directory);
+					if (await this.searchDirectoryForRepos(directory, this.maxDepthOfRepoSearch, true)) changes = true;
 				}
 				if (this.updateReposWorkspaceFolderIndex()) {
 					this.extensionState.saveRepos(this.repos);
 					changes = true;
 				}
-
-				if (changes) {
-					this.sendRepos();
-				}
+				if (changes) this.sendRepos();
 			}),
 
 			// Monitor changes to the maxDepthOfRepoSearch Extension Setting, and trigger a new search if needed
@@ -187,21 +195,20 @@ export class RepoManager extends Disposable {
 			return Promise.resolve();
 		}));
 		await this.searchWorkspaceForRepos();
-		this.startWatchingFolders();
 	}
 
-	/**
-	 * Remove any repositories that are no longer in the current workspace.
-	 */
-	private removeReposNotInWorkspace() {
-		const workspaceFolderInfo = getWorkspaceFolderInfoForRepoInclusionMapping();
-		const rootsExact = workspaceFolderInfo.rootsExact, rootsFolder = workspaceFolderInfo.rootsFolder, repoPaths = Object.keys(this.repos);
-		for (let i = 0; i < repoPaths.length; i++) {
-			const repoPathFolder = pathWithTrailingSlash(repoPaths[i]);
-			if (rootsExact.indexOf(repoPaths[i]) === -1 && !rootsFolder.find(root => repoPaths[i].startsWith(root)) && !rootsExact.find(root => root.startsWith(repoPathFolder))) {
-				this.removeRepo(repoPaths[i]);
+	/** Remove repositories that are no longer covered by any workspace folder. */
+	private removeReposNotInWorkspace(removedFolders?: string[]) {
+		const { rootsExact } = getWorkspaceFolderInfoForRepoInclusionMapping();
+		let changes = false;
+		for (const repo of Object.keys(this.repos)) {
+			if (removedFolders && !removedFolders.some((folder) => pathsOverlap(folder, repo))) continue;
+			if (!rootsExact.some((folder) => pathsOverlap(folder, repo))) {
+				this.removeRepo(repo);
+				changes = true;
 			}
 		}
+		return changes;
 	}
 
 	/**
@@ -211,7 +218,8 @@ export class RepoManager extends Disposable {
 	 */
 	public registerRepo(path: string, loadRepo: boolean) {
 		return new Promise<{ root: string | null, error: string | null }>(async resolve => {
-			let root = await this.dataSource.repoRoot(path);
+			const detectedRoot = await this.dataSource.repoRoot(path);
+			const root = detectedRoot === null ? null : getPathFromStr(detectedRoot);
 			if (root === null) {
 				resolve({ root: null, error: 'The folder "' + path + '" is not a Git repository.' });
 			} else if (typeof this.repos[root] !== 'undefined') {
@@ -296,6 +304,7 @@ export class RepoManager extends Disposable {
 	 * @returns The path of the known repository, or NULL if the specified repository is unknown.
 	 */
 	public async getKnownRepo(repo: string) {
+		repo = getPathFromStr(repo);
 		if (this.isKnownRepo(repo)) {
 			// The path is already known as a repo
 			return repo;
@@ -326,10 +335,11 @@ export class RepoManager extends Disposable {
 	/**
 	 * Add a new repository to Git Graph.
 	 * @param repo The path of the repository.
-	 * @returns TRUE => The repository was added, FALSE => The repository is ignored and couldn't be added.
+	 * @returns TRUE if the repository was added.
 	 */
 	private async addRepo(repo: string) {
-		if (this.ignoredRepos.includes(repo)) {
+		repo = getPathFromStr(repo);
+		if (this.isDisposed() || this.isKnownRepo(repo) || this.ignoredRepos.includes(repo)) {
 			return false;
 		} else {
 			this.repos[repo] = Object.assign({}, DEFAULT_REPO_STATE);
@@ -341,6 +351,7 @@ export class RepoManager extends Disposable {
 			this.logger.log('Added new repo: ' + repo);
 			await this.checkRepoForNewConfig(repo, true);
 			await this.searchRepoForSubmodules(repo);
+			await this.searchRepoForWorktrees(repo);
 			return true;
 		}
 	}
@@ -372,19 +383,6 @@ export class RepoManager extends Disposable {
 	}
 
 	/**
-	 * Checks if the specified path is within a known repository.
-	 * @param path The path to check.
-	 * @returns TRUE => Path is within a known repository, FALSE => Path isn't within a known repository.
-	 */
-	private isDirectoryWithinRepos(path: string) {
-		let repoPaths = Object.keys(this.repos);
-		for (let i = 0; i < repoPaths.length; i++) {
-			if (path === repoPaths[i] || path.startsWith(pathWithTrailingSlash(repoPaths[i]))) return true;
-		}
-		return false;
-	}
-
-	/**
 	 * Send the latest set of known repositories to subscribers as they have changed.
 	 * @param loadRepo The optional path of a repository to load in the Git Graph View.
 	 */
@@ -404,13 +402,17 @@ export class RepoManager extends Disposable {
 		let repoPaths = Object.keys(this.repos), changes = false;
 		return evalPromises(repoPaths, 3, (path) => this.dataSource.repoRoot(path)).then((results) => {
 			for (let i = 0; i < repoPaths.length; i++) {
-				if (results[i] === null) {
-					this.removeRepo(repoPaths[i]);
-					changes = true;
-				} else if (repoPaths[i] !== results[i]) {
-					this.transferRepoState(repoPaths[i], results[i]!);
-					changes = true;
+				const repo = repoPaths[i], root = results[i] === null ? null : getPathFromStr(results[i]!);
+				if (!this.isKnownRepo(repo) || root === repo) continue;
+				// Deleting a nested repository's .git can leave its directory inside the parent
+				// repository. Do not transfer the nested state to that parent.
+				if (root === null || this.isKnownRepo(root) || this.ignoredRepos.includes(root) ||
+					(path.relative(root, repo) !== '' && isWithinDirectory(root, repo))) {
+					this.removeRepo(repo);
+				} else {
+					this.transferRepoState(repo, root);
 				}
+				changes = true;
 			}
 		}).catch(() => { }).then(() => {
 			if (changes) {
@@ -521,7 +523,7 @@ export class RepoManager extends Disposable {
 		let rootFolders = vscode.workspace.workspaceFolders, changes = false;
 		if (typeof rootFolders !== 'undefined') {
 			for (let i = 0; i < rootFolders.length; i++) {
-				if (await this.searchDirectoryForRepos(getPathFromUri(rootFolders[i].uri), this.maxDepthOfRepoSearch)) changes = true;
+				if (await this.searchDirectoryForRepos(getPathFromUri(rootFolders[i].uri), this.maxDepthOfRepoSearch, true)) changes = true;
 			}
 		}
 		this.logger.log('Completed searching workspace for new repos');
@@ -535,35 +537,37 @@ export class RepoManager extends Disposable {
 	 * @param maxDepth The maximum depth to recursively search.
 	 * @returns TRUE => At least one repository was added, FALSE => No repositories were added.
 	 */
-	private searchDirectoryForRepos(directory: string, maxDepth: number) {
-		return new Promise<boolean>(resolve => {
-			if (this.isDirectoryWithinRepos(directory)) {
-				resolve(false);
-				return;
-			}
-
-			this.dataSource.repoRoot(directory).then(async (root) => {
-				if (root !== null) {
-					resolve(await this.addRepo(root));
-				} else if (maxDepth > 0) {
-					fs.readdir(directory, async (err, dirContents) => {
-						if (err) {
-							resolve(false);
-						} else {
-							let dirs = [];
-							for (let i = 0; i < dirContents.length; i++) {
-								if (dirContents[i] !== '.git' && await isDirectory(directory + '/' + dirContents[i])) {
-									dirs.push(directory + '/' + dirContents[i]);
-								}
+	private async searchDirectoryForRepos(directory: string, maxDepth: number, includeEnclosingRepo = false) {
+		let changes = false;
+		let directories = [directory];
+		for (let depth = 0; directories.length > 0 && !this.isDisposed(); depth++) {
+			const descend = depth < maxDepth;
+			const nextLevel = await evalPromises(directories, 8, async (candidate) => {
+				const entries = descend ? await fs.promises.readdir(candidate, { withFileTypes: true }).catch(() => []) : [];
+				const allowEnclosing = depth === 0 && includeEnclosingRepo;
+				try {
+					if (!this.isKnownRepo(candidate) && !this.ignoredRepos.includes(candidate)) {
+						// Probe Git only at a workspace root or where there is a .git marker (a file
+						// for worktrees and initialized submodules). Keep scanning below known roots.
+						if (allowEnclosing || (descend ? entries.some((entry) => entry.name === '.git') : await doesPathExist(path.join(candidate, '.git')))) {
+							const root = await this.dataSource.repoRoot(candidate);
+							const folders = vscode.workspace.workspaceFolders ?? [];
+							if (root !== null && (allowEnclosing || path.relative(candidate, root) === '') &&
+								folders.some((folder) => pathsOverlap(getPathFromUri(folder.uri), root)) && await this.addRepo(root)) {
+								changes = true;
 							}
-							resolve((await evalPromises(dirs, 2, dir => this.searchDirectoryForRepos(dir, maxDepth - 1))).indexOf(true) > -1);
 						}
-					});
-				} else {
-					resolve(false);
-				}
-			}).catch(() => resolve(false));
-		});
+					}
+				} catch (_) { } // An unreadable or vanishing directory must not abort the scan
+				return entries.filter(isScannableFolder)
+					.map((entry) => pathWithTrailingSlash(candidate) + entry.name);
+			});
+			directories = [];
+			for (const children of nextLevel) {
+				for (const child of children) directories.push(child);
+			}
+		}
+		return changes;
 	}
 
 	/**
@@ -588,6 +592,25 @@ export class RepoManager extends Disposable {
 			if (!this.isKnownRepo(submodules[i])) {
 				if (await this.addRepo(submodules[i])) changes = true;
 			}
+		}
+		return changes;
+	}
+
+	/**
+	 * Add the repository's working trees that live inside the workspace. Worktrees are often kept
+	 * in a hidden directory (e.g. `.worktrees/`), which the workspace scan skips.
+	 * @param repo The path of the repository to search.
+	 * @returns TRUE => At least one worktree was added, FALSE => No worktrees were added.
+	 */
+	private async searchRepoForWorktrees(repo: string) {
+		const worktrees = await this.dataSource.getWorktrees(repo);
+		const folders = vscode.workspace.workspaceFolders ?? [];
+		let changes = false;
+		for (const worktree of worktrees) {
+			const worktreePath = getPathFromStr(path.normalize(worktree.path));
+			if (worktreePath === repo || worktree.prunable || this.isKnownRepo(worktreePath) || this.ignoredRepos.includes(worktreePath)) continue;
+			if (!folders.some((folder) => pathsOverlap(getPathFromUri(folder.uri), worktreePath))) continue;
+			if (await isDirectory(worktreePath) && await this.addRepo(worktreePath)) changes = true;
 		}
 		return changes;
 	}
@@ -617,7 +640,7 @@ export class RepoManager extends Disposable {
 		// entry would orphan the previous watcher, whose handlers keep firing for the rest of
 		// the session — every event in the folder processed twice.
 		if (this.folderWatchers[path] !== undefined) return;
-		const watcher = vscode.workspace.createFileSystemWatcher(path + '/**');
+		const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path, '**'));
 		watcher.onDidCreate(this.onWatcherCreate.bind(this));
 		watcher.onDidChange(this.onWatcherChange.bind(this));
 		watcher.onDidDelete(this.onWatcherDelete.bind(this));
@@ -662,24 +685,31 @@ export class RepoManager extends Disposable {
 	 * @param uri The URI of the deletion event.
 	 */
 	private onWatcherDelete(uri: vscode.Uri) {
-		let path = getPathFromUri(uri);
-		if (path.indexOf('/.git/') > -1) return;
-		if (path.endsWith('/.git')) path = path.slice(0, -5);
-		if (this.removeReposWithinFolder(path)) this.sendRepos();
+		const deleted = getPathFromUri(uri);
+		if (deleted.includes('/.git/')) return;
+		if (deleted.endsWith('/.git')) {
+			const repo = getPathFromStr(path.dirname(deleted));
+			if (this.isKnownRepo(repo)) {
+				this.removeRepo(repo);
+				this.sendRepos();
+			}
+		} else if (this.removeReposWithinFolder(deleted)) {
+			this.sendRepos();
+		}
 	}
 
-	/**
-	 * Process a file system creation event.
-	 * @param path The path of the file that was created.
-	 * @returns TRUE => Change was made. FALSE => No change was made.
-	 */
-	private async processOnWatcherCreateEvent(path: string) {
-		if (await isDirectory(path)) {
-			if (await this.searchDirectoryForRepos(path, this.maxDepthOfRepoSearch)) {
-				return true;
-			}
+	/** Discover newly initialized repositories and repositories in newly added directories. */
+	private async processOnWatcherCreateEvent(directory: string) {
+		let remainingDepth = -1;
+		for (const folder of vscode.workspace.workspaceFolders ?? []) {
+			const root = getPathFromUri(folder.uri);
+			if (!isWithinDirectory(root, directory)) continue;
+			const parts = getPathFromStr(path.relative(root, directory)).split('/').filter(Boolean);
+			if (parts.some((part) => part.startsWith('.') || REPO_SCAN_EXCLUDED_FOLDERS.has(part))) continue;
+			remainingDepth = Math.max(remainingDepth, this.maxDepthOfRepoSearch - parts.length);
 		}
-		return false;
+		if (remainingDepth < 0 || !await isDirectory(directory)) return false;
+		return this.searchDirectoryForRepos(directory, remainingDepth);
 	}
 
 	/**
@@ -784,6 +814,15 @@ export class RepoManager extends Disposable {
 	}
 }
 
+function isWithinDirectory(parent: string, directory: string) {
+	const relative = path.relative(parent, directory);
+	return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+}
+
+function pathsOverlap(a: string, b: string) {
+	return isWithinDirectory(a, b) || isWithinDirectory(b, a);
+}
+
 /**
  * Gets the current workspace folders, and generates information required to identify whether a repository is within any of the workspace folders.
  * @returns The Workspace Folder Information.
@@ -809,7 +848,7 @@ function getWorkspaceFolderInfoForRepoInclusionMapping() {
  */
 function isDirectory(path: string) {
 	return new Promise<boolean>(resolve => {
-		fs.stat(path, (err, stats) => {
+		fs.lstat(path, (err, stats) => {
 			resolve(err ? false : stats.isDirectory());
 		});
 	});
